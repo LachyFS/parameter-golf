@@ -100,9 +100,10 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 0))  # 0 = use train_seq_len
     swa_interval = int(os.environ.get("SWA_INTERVAL", 200))
     swa_count = int(os.environ.get("SWA_COUNT", 7))
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
-    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 2048))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 64))
     use_qat = bool(int(os.environ.get("USE_QAT", "1")))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.75))  # activate QAT at 75% of wallclock
     fp16_passthrough_patterns = os.environ.get("FP16_PASSTHROUGH_PATTERNS", "tok_emb")
 
 # -----------------------------
@@ -1021,16 +1022,18 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # Enable STE QAT on weight matrices (not on fp16-passthrough tensors).
+    # QAT is activated late in training (at qat_start_frac of wallclock).
+    # Mark which modules are QAT-eligible, but don't enable yet.
+    qat_eligible_modules: list[CastedLinear] = []
     if args.use_qat:
         for name, module in base_model.named_modules():
             if isinstance(module, CastedLinear):
-                # Don't QAT the bigram hash projection or late-layer key projections.
                 is_late_k = ".c_k" in name and any(
                     f"blocks.{i}." in name for i in range(args.num_layers - LATE_K_PASSTHROUGH_LAYERS, args.num_layers)
                 )
                 if not is_late_k:
-                    module._qat_enabled = True
+                    qat_eligible_modules.append(module)
+    qat_activated = False
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1205,6 +1208,19 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+
+        # Late QAT activation: enable at qat_start_frac of wallclock.
+        if not qat_activated and max_wallclock_ms is not None and qat_eligible_modules:
+            if elapsed_ms >= max_wallclock_ms * args.qat_start_frac:
+                for m in qat_eligible_modules:
+                    m._qat_enabled = True
+                qat_activated = True
+                # Force recompilation with QAT-enabled forward.
+                torch._dynamo.reset()
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+                log0(f"QAT activated at step:{step} elapsed:{elapsed_ms:.0f}ms")
+
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
